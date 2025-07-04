@@ -6,7 +6,6 @@ let screenshotInterval = null;
 let audioContext = null;
 let audioProcessor = null;
 let micMediaStream = null;
-let micAudioProcessor = null;
 let audioBuffer = [];
 const SAMPLE_RATE = 24000;
 const AUDIO_CHUNK_DURATION = 0.1;
@@ -15,9 +14,22 @@ const BUFFER_SIZE = 4096;
 let systemAudioBuffer = [];
 const MAX_SYSTEM_BUFFER_SIZE = 10;
 
-// let hiddenVideo = null;
-// let offscreenCanvas = null;
-// let offscreenContext = null;
+function isVoiceActive(audioFloat32Array, threshold = 0.005) {
+    if (!audioFloat32Array || audioFloat32Array.length === 0) {
+        return false;
+    }
+
+    let sumOfSquares = 0;
+    for (let i = 0; i < audioFloat32Array.length; i++) {
+        sumOfSquares += audioFloat32Array[i] * audioFloat32Array[i];
+    }
+    const rms = Math.sqrt(sumOfSquares / audioFloat32Array.length);
+
+    // console.log(`VAD RMS: ${rms.toFixed(4)}`); // For debugging VAD threshold
+
+    return rms > threshold;
+}
+
 let currentImageQuality = 'medium'; // Store current image quality for manual screenshots
 let lastScreenshotBase64 = null; // Store the latest screenshot
 
@@ -217,16 +229,33 @@ class SimpleAEC {
         this.sampleRate = 24000;
         this.delaySamples = Math.floor((this.echoDelay / 1000) * this.sampleRate);
 
-        this.echoGain = 0.5;
+        this.echoGain = 0.9;
         this.noiseFloor = 0.01;
 
-        console.log('🎯 Weakened AEC initialized');
+        // 🔧 Adaptive-gain parameters (User-tuned, very aggressive)
+        this.targetErr = 0.002;
+        this.adaptRate  = 0.1;
+
+        console.log('🎯 AEC initialized (hyper-aggressive)');
     }
 
     process(micData, systemData) {
         if (!systemData || systemData.length === 0) {
             return micData;
         }
+
+        for (let i = 0; i < systemData.length; i++) {
+            if (systemData[i] > 0.98) systemData[i] = 0.98;
+            else if (systemData[i] < -0.98) systemData[i] = -0.98;
+
+            systemData[i] = Math.tanh(systemData[i] * 4);
+        }
+
+        let sum2 = 0;
+        for (let i = 0; i < systemData.length; i++) sum2 += systemData[i] * systemData[i];
+        const rms = Math.sqrt(sum2 / systemData.length);
+        const targetRms = 0.08;                   // 🔧 기준 RMS (기존 0.1)
+        const scale = targetRms / (rms + 1e-6);   // 1e-6: 0-division 방지
 
         const output = new Float32Array(micData.length);
 
@@ -239,22 +268,31 @@ class SimpleAEC {
                 const delayIndex = i - optimalDelay - d;
                 if (delayIndex >= 0 && delayIndex < systemData.length) {
                     const weight = Math.exp(-Math.abs(d) / 1000);
-                    echoEstimate += systemData[delayIndex] * this.echoGain * weight;
+                    echoEstimate += systemData[delayIndex] * scale * this.echoGain * weight;
                 }
             }
 
-            output[i] = micData[i] - echoEstimate * 0.5;
+            output[i] = micData[i] - echoEstimate * 0.9;
 
             if (Math.abs(output[i]) < this.noiseFloor) {
                 output[i] *= 0.5;
             }
 
             if (this.isSimilarToSystem(output[i], systemData, i, optimalDelay)) {
-                output[i] *= 0.5;
+                output[i] *= 0.25;
             }
 
             output[i] = Math.max(-1, Math.min(1, output[i]));
         }
+
+
+        let errSum = 0;
+        for (let i = 0; i < output.length; i++) errSum += output[i] * output[i];
+        const errRms = Math.sqrt(errSum / output.length);
+
+        const err = errRms - this.targetErr;
+        this.echoGain += this.adaptRate * err;      // 비례 제어
+        this.echoGain  = Math.max(0, Math.min(1, this.echoGain));
 
         return output;
     }
@@ -297,7 +335,7 @@ class SimpleAEC {
             }
         }
 
-        return similarity / (2 * windowSize + 1) < 0.2;
+        return similarity / (2 * windowSize + 1) < 0.15;
     }
 }
 
@@ -438,9 +476,8 @@ async function initializeopenai(profile = 'interview', language = 'en') {
     }
 }
 
-// Listen for real-time STT updates 다음에 추가
+
 ipcRenderer.on('system-audio-data', (event, { data }) => {
-    // 시스템 오디오를 버퍼에 저장
     systemAudioBuffer.push({
         data: data,
         timestamp: Date.now(),
@@ -494,24 +531,6 @@ ipcRenderer.on('stt-update', (event, data) => {
     }
 });
 
-////////// for index & subjects 📥 //////////
-// ipcRenderer.on('update-outline', (_, outline) => {
-//     window.pickleGlass.setOutline(outline);
-// });
-// ipcRenderer.on('update-analysis-requests', (_, reqs) => {
-//     window.pickleGlass.setAnalysisRequests(reqs);
-// });
-// ipcRenderer.on('update-outline', (_, outline) => {
-//     console.log('📥 Received outline update:', outline);
-//     window.pickleGlass.outlines = outline;
-//     window.pickleGlass.setOutline(outline);
-// });
-
-// ipcRenderer.on('update-analysis-requests', (_, reqs) => {
-//     console.log('📥 Received analysis requests update:', reqs);
-//     window.pickleGlass.analysisRequests = reqs;
-//     window.pickleGlass.setAnalysisRequests(reqs);
-// });
 
 ipcRenderer.on('update-structured-data', (_, structuredData) => {
     console.log('📥 Received structured data update:', structuredData);
@@ -553,17 +572,6 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
                 throw new Error('Failed to start screen capture: ' + screenResult.error);
             }
 
-            // Get screen capture for screenshots
-            // mediaStream = await navigator.mediaDevices.getDisplayMedia({
-            //     video: {
-            //         frameRate: 1,
-            //         width: { ideal: 1920 },
-            //         height: { ideal: 1080 },
-            //     },
-            //     audio: false, // Don't use browser audio on macOS
-            // });
-
-            ////////// for index & subjects //////////
 
             try {
                 micMediaStream = await navigator.mediaDevices.getUserMedia({
@@ -669,39 +677,6 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
     }
 }
 
-////////// for index & subjects //////////
-// function setupMicProcessing(micStream) {
-//     // Setup microphone audio processing for Linux
-//     const micAudioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
-//     const micSource = micAudioContext.createMediaStreamSource(micStream);
-//     const micProcessor = micAudioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
-
-//     let audioBuffer = [];
-//     const samplesPerChunk = SAMPLE_RATE * AUDIO_CHUNK_DURATION;
-
-//     micProcessor.onaudioprocess = async e => {
-//         const inputData = e.inputBuffer.getChannelData(0);
-//         audioBuffer.push(...inputData);
-
-//         // Process audio in chunks
-//         while (audioBuffer.length >= samplesPerChunk) {
-//             const chunk = audioBuffer.splice(0, samplesPerChunk);
-//             const pcmData16 = convertFloat32ToInt16(chunk);
-//             const base64Data = arrayBufferToBase64(pcmData16.buffer);
-
-//             await ipcRenderer.invoke('send-audio-content', {
-//                 data: base64Data,
-//                 mimeType: 'audio/pcm;rate=24000',
-//             });
-//         }
-//     };
-
-//     micSource.connect(micProcessor);
-//     micProcessor.connect(micAudioContext.destination);
-
-//     // Store processor reference for cleanup
-//     audioProcessor = micProcessor;
-// }
 function setupMicProcessing(micStream) {
     const micAudioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
     const micSource = micAudioContext.createMediaStreamSource(micStream);
@@ -716,18 +691,21 @@ function setupMicProcessing(micStream) {
 
         while (audioBuffer.length >= samplesPerChunk) {
             let chunk = audioBuffer.splice(0, samplesPerChunk);
+            let processedChunk = new Float32Array(chunk);
 
+            // Check for system audio and apply AEC only if voice is active
             if (aecProcessor && systemAudioBuffer.length > 0) {
                 const latestSystemAudio = systemAudioBuffer[systemAudioBuffer.length - 1];
                 const systemFloat32 = base64ToFloat32Array(latestSystemAudio.data);
 
-                const processedChunk = aecProcessor.process(new Float32Array(chunk), systemFloat32);
-
-                chunk = Array.from(processedChunk);
-                console.log('🔊 Applied AEC processing to mic audio');
+                // Apply AEC only when system audio has active speech
+                if (isVoiceActive(systemFloat32)) {
+                    processedChunk = aecProcessor.process(new Float32Array(chunk), systemFloat32);
+                    console.log('🔊 Applied AEC because system audio is active');
+                }
             }
 
-            const pcmData16 = convertFloat32ToInt16(chunk);
+            const pcmData16 = convertFloat32ToInt16(processedChunk);
             const base64Data = arrayBufferToBase64(pcmData16.buffer);
 
             await ipcRenderer.invoke('send-audio-content', {
@@ -1104,33 +1082,6 @@ async function sendMessage(userPrompt, options = {}) {
     }
 }
 
-async function captureCurrentScreenshot() {
-    return new Promise((resolve, reject) => {
-        if (!offscreenCanvas || !offscreenContext) {
-            reject(new Error('Canvas not initialized'));
-            return;
-        }
-
-        offscreenCanvas.toBlob(
-            async blob => {
-                if (!blob) {
-                    reject(new Error('Failed to create screenshot blob'));
-                    return;
-                }
-
-                const reader = new FileReader();
-                reader.onloadend = () => {
-                    const base64data = reader.result.split(',')[1];
-                    resolve(base64data);
-                };
-                reader.onerror = () => reject(new Error('Failed to read screenshot blob'));
-                reader.readAsDataURL(blob);
-            },
-            'image/jpeg',
-            0.8
-        );
-    });
-}
 
 const apiClient = window.require ? window.require('../common/services/apiClient') : undefined;
 
@@ -1240,5 +1191,18 @@ ipcRenderer.on('session-state-changed', (_event, { isActive }) => {
     if (!isActive) {
         console.log('[Renderer] Session ended – stopping local capture');
         stopCapture();
+    } else {
+        console.log('[Renderer] New session started – clearing in-memory history and summaries');
+
+        // Reset live conversation & analysis caches
+        realtimeConversationHistory = [];
+
+        const blankData = {
+            summary: [],
+            topic: { header: '', bullets: [] },
+            actions: [],
+            followUps: [],
+        };
+        window.pickleGlass.setStructuredData(blankData);
     }
 });
